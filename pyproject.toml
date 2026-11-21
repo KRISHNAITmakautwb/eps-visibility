@@ -1,0 +1,12 @@
+[project]
+name = "eps-visibility"
+version = "3.0.0"
+description = "Polarization-visibility scan of the entangled photon source (Qutess FPGA + Arduino rotation stage)"
+requires-python = ">=3.9"
+dependencies = ["numpy", "pyserial", "PyQt6", "matplotlib"]
+
+[project.scripts]
+eps-visibility = "eps_visibility.__main__:main"
+
+[tool.setuptools]
+packages = ["eps_visibility", "eps_visibility.hardware"]
