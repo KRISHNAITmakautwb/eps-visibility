@@ -18,7 +18,7 @@ from . import config
 from .analysis import analyse, fit_curve, series
 from .config import APP_TITLE, CHANNEL_LABELS, DIRECTIONS, STAGE_IDS
 from .hardware import (ShmCounts, SimCounts, SimStage, SimWorld, Stage, UartCounts,
-                       detect_fpga_port, list_serial_ports, parse_stage_reply)
+                       detect_fpga_port, guess_stage_port, list_serial_ports, parse_stage_reply)
 from .scan import run_scan
 from .storage import save_scan_csv
 
@@ -58,6 +58,7 @@ class EpsVisibilityApp(QMainWindow):
         self.source = None
         self.stage = None
         self.scan_thread = None
+        self.stage_busy = False    # connecting, or a manual move in progress
         self.abort = threading.Event()
         self.points = []           # dicts: index, angle, n, mean[10], std[10]
         self.scan_params = {}
@@ -222,19 +223,14 @@ class EpsVisibilityApp(QMainWindow):
 
     def refresh_ports(self):
         ports = list_serial_ports()
-        for cb in (self.fpga_port, self.stage_port):
-            cur = cb.currentText()
+        defaults = {self.fpga_port: detect_fpga_port(), self.stage_port: guess_stage_port()}
+        for cb, default in defaults.items():
+            cur = cb.currentText().strip()
             cb.clear()
             cb.addItems(ports)
-            if cur:
-                cb.setCurrentText(cur)
-        fpga = detect_fpga_port()
-        if fpga and not self.fpga_port.currentText():
-            self.fpga_port.setCurrentText(fpga)
-        if fpga:
-            others = [p for p in ports if p != fpga]
-            if others and self.stage_port.currentText() in ("", fpga):
-                self.stage_port.setCurrentText(others[0])
+            # keep a still-present user choice; otherwise use the detected port
+            choice = cur if cur in ports else (default or cur)
+            cb.setCurrentText(choice or "")
         if not ports:
             self.log("No serial ports found (tick 'Simulate hardware' to try the app without devices)")
 
@@ -245,14 +241,16 @@ class EpsVisibilityApp(QMainWindow):
         busy = self._scanning()
         conn = self.stage is not None and self.stage.connected
         running = self.source is not None and self.source.alive
-        self.step_btn.setEnabled(conn and not busy)
-        self.home_btn.setEnabled(conn and not busy)
-        self.stage_btn.setEnabled(not busy)
-        self.stage_btn.setText("Disconnect" if conn else "Connect")
+        sbusy = self.stage_busy
+        self.step_btn.setEnabled(conn and not busy and not sbusy)
+        self.home_btn.setEnabled(conn and not busy and not sbusy)
+        self.stage_btn.setEnabled(not busy and not sbusy)
+        self.stage_btn.setText("Working…" if sbusy else ("Disconnect" if conn else "Connect"))
         self.counts_btn.setText("Stop counts" if running else "Start counts")
         self.counts_btn.setEnabled(not busy)
         self.sim_cb.setEnabled(not running and not conn)
         self.scan_btn.setText("Stop scan" if busy else "Start scan")
+        self.scan_btn.setEnabled(busy or not sbusy)
 
     # ---------------- counts
     def toggle_counts(self):
@@ -271,6 +269,10 @@ class EpsVisibilityApp(QMainWindow):
             port = self.fpga_port.currentText().strip()
             if not port:
                 QMessageBox.warning(self, APP_TITLE, "Choose the FPGA serial port first.")
+                return
+            if isinstance(self.stage, Stage) and self.stage.connected and self.stage.ser is not None \
+                    and self.stage.ser.port == port:
+                QMessageBox.warning(self, APP_TITLE, "That port is the rotation stage; pick the FPGA port.")
                 return
             raw = os.path.join(config.DATA_DIR, f"raw_counts_{time.strftime('%Y%m%d_%H%M%S')}.csv")
             self.source = UartCounts(self.log, port, self.interval.value(),
@@ -299,8 +301,8 @@ class EpsVisibilityApp(QMainWindow):
             return
         self.stage = SimStage(self.log, self._stage_reply, self.world) if sim \
             else Stage(self.log, self._stage_reply)
-        self.stage_btn.setEnabled(False)
-        self.stage_btn.setText("Connecting…")
+        self.stage_busy = True
+        self._set_buttons()
 
         def work():
             try:
@@ -308,23 +310,25 @@ class EpsVisibilityApp(QMainWindow):
                 self.log(f"Stage connected on {port or 'SIM'}")
             except Exception as exc:
                 self.log(f"Stage connection error: {exc}")
+                if self.stage is not None:
+                    self.stage.close()
                 self.stage = None
-            self.events.put(("ui", None))
+            self.events.put(("stage_idle", None))
         threading.Thread(target=work, daemon=True).start()
 
     def manual_move(self, mode):
         stage, d, a = self.stage_sel.currentText(), self.man_dir.currentText(), self.man_angle.value()
         if mode == "Home":
             a = 0
-        self.step_btn.setEnabled(False)
-        self.home_btn.setEnabled(False)
+        self.stage_busy = True
+        self._set_buttons()
 
         def work():
             try:
                 self.stage.move(a, d, mode, stage)
             except Exception as exc:
                 self.log(f"Stage error: {exc}")
-            self.events.put(("ui", None))
+            self.events.put(("stage_idle", None))
         threading.Thread(target=work, daemon=True).start()
 
     # ---------------- scan
@@ -343,7 +347,8 @@ class EpsVisibilityApp(QMainWindow):
                  offset_dir=self.offset_dir.currentText(), direction=self.scan_dir.currentText(),
                  nsteps=self.nsteps.value(), step=self.span.value() / self.nsteps.value(),
                  settle_s=self.settle.value(), navg=self.navg.value(),
-                 interval_ms=self.interval.value(), coinc=self.coinc_ch.currentText(),
+                 # the interval the counts were actually started with (the box may have changed)
+                 interval_ms=getattr(self.source, "interval_ms", self.interval.value()), coinc=self.coinc_ch.currentText(),
                  hwp=self.hwp.isChecked(), home_end=self.home_end.isChecked(),
                  simulated=self.sim_cb.isChecked(),
                  started=time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -410,7 +415,10 @@ class EpsVisibilityApp(QMainWindow):
 
     # ---------------- saving
     def _save(self, csv_path):
-        save_scan_csv(csv_path, self.points, self.scan_params, self.analysis())
+        self.redraw()     # make sure the figure has every point before it is written
+        # record the HWP setting the visibility was computed with (it can be toggled after a scan)
+        params = dict(self.scan_params, hwp=self.hwp.isChecked())
+        save_scan_csv(csv_path, self.points, params, self.analysis())
         self.fig.savefig(os.path.splitext(csv_path)[0] + ".png", dpi=150)
 
     def save_as(self):
@@ -461,6 +469,8 @@ class EpsVisibilityApp(QMainWindow):
                 self.events.put(("autosave", None))
             elif kind == "autosave":
                 self._autosave()
+            elif kind == "stage_idle":
+                self.stage_busy = False
             self._set_buttons()
         if redraw:
             self.redraw()

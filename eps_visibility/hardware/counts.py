@@ -1,5 +1,7 @@
 """Live 10-channel count sources: direct FPGA UART, or producer.py's shared memory."""
+import os
 import queue
+import sys
 import threading
 import time
 
@@ -106,8 +108,9 @@ class UartCounts(CountsSource):
 
         config = dict(mode="Serial", com_port=self.port, report_interval_str=str(self.interval_ms),
                       out_path=self.raw_csv, taps=list(self.taps))
+        rows = 0
         try:
-            record_uart_counts(
+            _, rows = record_uart_counts(
                 config, serial_factory=serial.Serial, receiver_factory=StatusReceiver,
                 commands=dict(send=send_command, mode=cmd_set_mode, tap=cmd_set_tap,
                               sync=lambda *a, **kw: b"", run=cmd_set_run_id,
@@ -118,16 +121,49 @@ class UartCounts(CountsSource):
         finally:
             if shm is not None:
                 shm.close()
-                shm.unlink()
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+            if not rows and self.seq == 0:
+                _remove_header_only_csv(self.raw_csv)
+
+
+def _remove_header_only_csv(path):
+    """A failed connection leaves a CSV with just the header line; don't litter data/."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if sum(1 for _ in fh) <= 1:
+                os.remove(path)
+    except OSError:
+        pass
+
+
+def _attach_shared_memory(name):
+    """Attach without registering with the resource tracker.
+
+    On Linux/macOS (Python < 3.13) an attaching process otherwise *unlinks* the segment when it
+    exits, which would destroy producer.py's shared memory when this app closes.
+    """
+    from multiprocessing import shared_memory
+    if sys.version_info >= (3, 13):
+        return shared_memory.SharedMemory(name=name, track=False)
+    shm = shared_memory.SharedMemory(name=name)
+    if os.name == "posix":
+        from multiprocessing import resource_tracker
+        try:
+            resource_tracker.unregister(shm._name, "shared_memory")
+        except Exception:
+            pass
+    return shm
 
 
 class ShmCounts(CountsSource):
     """Reads what producer.py writes (run producer.py separately; it owns the FPGA port)."""
 
     def _run(self):
-        from multiprocessing import shared_memory
         try:
-            shm = shared_memory.SharedMemory(name=SHM_NAME)
+            shm = _attach_shared_memory(SHM_NAME)
         except FileNotFoundError:
             raise RuntimeError(f"shared memory '{SHM_NAME}' not found - start producer.py first")
         try:
