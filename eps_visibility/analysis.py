@@ -62,7 +62,9 @@ def analyse(points, coinc_index, hwp):
     ang, mean, err = s
     period = 90.0 if hwp else 180.0
     y = mean[:, coinc_index]
+    # Less than half a period (e.g. early in a scan) does not constrain the fit: V can exceed 1.
+    enough = len(ang) > 1 and (ang.max() - ang.min()) >= period / 2
     return dict(ci=coinc_index, raw=raw_visibility(y),
-                fit=fit_visibility(ang, y, err[:, coinc_index], period),
+                fit=fit_visibility(ang, y, err[:, coinc_index], period) if enough else None,
                 ymax=float(y.max()), ymin=float(y.min()),
                 at_max=float(ang[y.argmax()]), at_min=float(ang[y.argmin()]))

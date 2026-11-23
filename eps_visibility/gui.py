@@ -21,6 +21,9 @@ from .hardware import (ShmCounts, SimCounts, SimStage, SimWorld, Stage, UartCoun
                        detect_fpga_port, guess_stage_port, list_serial_ports, parse_stage_reply)
 from .scan import run_scan
 from .storage import save_scan_csv
+from .theme import C, set_role, status_dot, style_axes
+
+SIM_TEXT = "SIMULATION – NOT REAL DATA"
 
 
 def spin(lo, hi, val, step=1, dec=None, suffix=""):
@@ -84,12 +87,25 @@ class EpsVisibilityApp(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(left)
-        scroll.setMinimumWidth(430)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        side = QWidget()                     # settings scroll; the action bar stays put
+        sv = QVBoxLayout(side)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(0)
+        sv.addWidget(scroll, 1)
+        sv.addWidget(self._build_action_bar())
+        side.setMinimumWidth(440)
 
         right = QWidget()
         rv = QVBoxLayout(right)
+        self.sim_banner = QLabel(SIM_TEXT + "  —  counts and stage are fake (untick 'Simulate hardware')")
+        self.sim_banner.setProperty("role", "sim-banner")
+        self.sim_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sim_banner.setVisible(False)
+        rv.addWidget(self.sim_banner)
+        self.sim_cb.toggled.connect(self._update_sim_marks)
         self.result_lbl = QLabel("Visibility: —")
-        self.result_lbl.setStyleSheet("font-size: 18px; font-weight: bold; padding: 4px;")
         self.result_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         rv.addWidget(self.result_lbl)
         self.fig = Figure(figsize=(8, 6), layout="constrained")
@@ -101,12 +117,40 @@ class EpsVisibilityApp(QMainWindow):
         rv.addWidget(self.log_box, 1)
 
         split = QSplitter()
-        split.addWidget(scroll)
+        split.addWidget(side)
         split.addWidget(right)
         split.setStretchFactor(1, 1)
         self.setCentralWidget(split)
+        self._standardise_buttons()
         self.redraw()
         self._set_buttons()
+
+    def _standardise_buttons(self):
+        """One convention for every button: tooltip, fixed size (no jumping), standard shortcuts."""
+        from PyQt6.QtGui import QKeySequence, QShortcut
+
+        def fix(btn, width, tip):
+            btn.setMinimumWidth(width)
+            btn.setMinimumHeight(34)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        fix(self.counts_btn, 200, "Start or stop reading counts from the FPGA (or the simulator)")
+        fix(self.refresh_btn, 96, "Search again for serial ports (FPGA and Arduino)")
+        fix(self.stage_btn, 120, "Connect to or disconnect from the Arduino rotation stage")
+        fix(self.step_btn, 80, "Rotate the selected stage by the angle, in the chosen direction")
+        fix(self.home_btn, 80, "Send the selected stage to its home position")
+        fix(self.scan_btn, 200, "Start the visibility scan  ·  Esc stops a running scan")
+        fix(self.save_btn, 120, "Save the current scan as CSV + PNG  ·  Ctrl+S")
+        self.step_btn.setMaximumWidth(80)
+        self.home_btn.setMaximumWidth(80)
+
+        QShortcut(QKeySequence.StandardKey.Save, self, activated=self.save_as)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self._stop_scan_if_running)
+
+    def _stop_scan_if_running(self):
+        if self._scanning():
+            self.toggle_scan()
 
     def _build_counts_box(self):
         g = QGroupBox("Photon counts (Qutess FPGA)")
@@ -125,7 +169,10 @@ class EpsVisibilityApp(QMainWindow):
         f.addRow(self.shm_pub)
         self.counts_btn = QPushButton("Start counts")
         self.counts_btn.clicked.connect(self.toggle_counts)
-        f.addRow(self.counts_btn)
+        self.counts_dot = QLabel()
+        self.counts_state = QLabel("Stopped")
+        self.counts_state.setProperty("role", "muted")
+        f.addRow(hbox(self.counts_btn, self.counts_dot, self.counts_state, stretch={0: 1}))
         return g
 
     def _build_live_box(self):
@@ -136,10 +183,11 @@ class EpsVisibilityApp(QMainWindow):
             grid.addWidget(QLabel(name), i % 5, (i // 5) * 2)
             lbl = QLabel("—")
             lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            lbl.setStyleSheet("font-family: monospace; font-weight: bold;")
+            lbl.setProperty("role", "count-single" if i < 4 else "count-coinc")
             grid.addWidget(lbl, i % 5, (i // 5) * 2 + 1)
             self.count_lbls.append(lbl)
         self.seq_lbl = QLabel("report #0")
+        self.seq_lbl.setProperty("role", "muted")
         grid.addWidget(self.seq_lbl, 5, 0, 1, 4)
         return g
 
@@ -148,11 +196,13 @@ class EpsVisibilityApp(QMainWindow):
         f = QFormLayout(g)
         self.stage_port = QComboBox()
         self.stage_port.setEditable(True)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh_ports)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_ports)
         self.stage_btn = QPushButton("Connect")
         self.stage_btn.clicked.connect(self.toggle_stage)
-        f.addRow("Port", hbox(self.stage_port, refresh, self.stage_btn, stretch={0: 1}))
+        self.stage_dot = QLabel()
+        f.addRow("Port", hbox(self.stage_port, self.refresh_btn, self.stage_btn, self.stage_dot,
+                              stretch={0: 1}))
         self.stage_sel = QComboBox()
         self.stage_sel.addItems(STAGE_IDS)
         f.addRow("Stage", self.stage_sel)
@@ -204,13 +254,31 @@ class EpsVisibilityApp(QMainWindow):
         self.autosave = QCheckBox("Auto-save CSV + PNG to eps/data/")
         self.autosave.setChecked(True)
         f.addRow(self.autosave)
+        return g
+
+    def _build_action_bar(self):
+        """Start scan / Save as, pinned under the scrolling settings so they are always visible."""
         self.scan_btn = QPushButton("Start scan")
-        self.scan_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         self.scan_btn.clicked.connect(self.toggle_scan)
         self.save_btn = QPushButton("Save as…")
         self.save_btn.clicked.connect(self.save_as)
-        f.addRow(hbox(self.scan_btn, self.save_btn, stretch={0: 2, 1: 1}))
-        return g
+        bar = hbox(self.scan_btn, self.save_btn, stretch={0: 2, 1: 1})
+        bar.setObjectName("actionBar")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        bar.layout().setContentsMargins(10, 8, 10, 8)
+        return bar
+
+    def _showing_sim(self):
+        """True when what is on screen is fake: sim mode now, or the plotted scan was simulated."""
+        if self.points:
+            return bool(self.scan_params.get("simulated"))
+        return self.sim_cb.isChecked()
+
+    def _update_sim_marks(self, *_):
+        sim_now = self.sim_cb.isChecked()
+        self.sim_banner.setVisible(sim_now or self._showing_sim())
+        self.setWindowTitle(f"{APP_TITLE}  —  {SIM_TEXT}" if sim_now else APP_TITLE)
+        self.redraw()
 
     def _update_step_lbl(self):
         self.step_lbl.setText(f"{self.span.value() / self.nsteps.value():.4g} °  "
@@ -251,6 +319,14 @@ class EpsVisibilityApp(QMainWindow):
         self.sim_cb.setEnabled(not running and not conn)
         self.scan_btn.setText("Stop scan" if busy else "Start scan")
         self.scan_btn.setEnabled(busy or not sbusy)
+        # colours: green = start, red = stop; status lights next to counts and stage
+        set_role(self.counts_btn, "stop" if running else "go")
+        set_role(self.scan_btn, "stop" if busy else "go")
+        failed = self.source is not None and self.source.error
+        self.counts_dot.setStyleSheet(status_dot(C["ok"] if running else
+                                                 C["bad"] if failed else C["idle"]))
+        self.counts_state.setText("Running" if running else "Error - see log" if failed else "Stopped")
+        self.stage_dot.setStyleSheet(status_dot(C["ok"] if conn else C["idle"]))
 
     # ---------------- counts
     def toggle_counts(self):
@@ -356,7 +432,7 @@ class EpsVisibilityApp(QMainWindow):
         self.points = []
         self.last_saved = None
         self.abort.clear()
-        self.redraw()
+        self._update_sim_marks()      # banner follows the new scan (redraws too)
         self.scan_thread = threading.Thread(
             target=run_scan, daemon=True,
             args=(p, self.source, self.stage, self.abort,
@@ -378,39 +454,50 @@ class EpsVisibilityApp(QMainWindow):
         self.ax_s.set_ylabel("Singles / report")
         self.ax_c.set_ylabel("Coincidences / report")
         self.ax_c.set_xlabel("Stage angle (°)")
-        self.ax_s.grid(alpha=0.3)
-        self.ax_c.grid(alpha=0.3)
+        style_axes(self.fig, (self.ax_s, self.ax_c))
+        for t in list(self.fig.texts):
+            t.remove()
+        if self._showing_sim():   # stamped on the figure itself, so it is also in every saved PNG
+            self.fig.text(0.5, 0.5, SIM_TEXT, ha="center", va="center", rotation=22,
+                          fontsize=34, fontweight="bold", color=C["bad"], alpha=0.16, zorder=0)
         if self.hwp.isChecked():
             sec = self.ax_s.secondary_xaxis("top", functions=(lambda x: 2 * x, lambda x: x / 2))
-            sec.set_xlabel("Polarization angle (°)")
+            sec.set_xlabel("Polarization angle (°)", color=C["muted"])
+            sec.tick_params(colors=C["muted"])
+            sec.spines["top"].set_color(C["border"])
         s = series(self.points)
         res = self.analysis()
         if s is not None:
             ang, mean, err = s
-            for k, col in ((0, "tab:red"), (1, "tab:blue")):
+            for k, col in ((0, C["accent"]), (1, C["accent2"])):
                 self.ax_s.errorbar(ang, mean[:, k], err[:, k], fmt="o-", ms=4, color=col,
                                    label=CHANNEL_LABELS[k], capsize=2)
-            self.ax_s.legend(loc="best", fontsize=8)
+            self.ax_s.legend(loc="best", fontsize=8, frameon=False)
             ci = res["ci"]
-            self.ax_c.errorbar(ang, mean[:, ci], err[:, ci], fmt="o", ms=5, color="tab:red",
-                               label=CHANNEL_LABELS[ci], capsize=2)
             if res["fit"]:
                 xs = np.linspace(ang.min(), ang.max(), 400)
-                self.ax_c.plot(xs, fit_curve(res["fit"], xs), "-", color="0.35", lw=1.2,
-                               label="cos² fit")
-            self.ax_c.legend(loc="best", fontsize=8)
+                self.ax_c.plot(xs, fit_curve(res["fit"], xs), "-", color=C["fit"], lw=1.4,
+                               label="cos² fit", zorder=1)
+            self.ax_c.errorbar(ang, mean[:, ci], err[:, ci], fmt="o", ms=6, color=C["coinc"],
+                               mec="white", mew=0.8, label=CHANNEL_LABELS[ci], capsize=2, zorder=2)
+            self.ax_c.legend(loc="best", fontsize=8, frameon=False)
         self.canvas.draw_idle()
         self._show_result(res)
 
     def _show_result(self, res):
         if not res or res["raw"] is None:
+            set_role(self.result_lbl, "result-empty")
             self.result_lbl.setText("Visibility: —")
             return
+        set_role(self.result_lbl, "result")
         txt = (f"Visibility (max−min)/(max+min) = {res['raw']:.4f}   "
                f"[max {res['ymax']:,.0f} @ {res['at_max']:g}°, min {res['ymin']:,.0f} @ {res['at_min']:g}°]")
         if res["fit"]:
             f = res["fit"]
             txt += f"\nFitted visibility = {f['V']:.4f} ± {f['dV']:.4f}   (fit max at stage {f['x_max']:.2f}°)"
+        if self._showing_sim():
+            txt = "[SIMULATED]  " + txt
+            set_role(self.result_lbl, "result-empty")   # never the green "real result" box
         self.result_lbl.setText(txt)
 
     # ---------------- saving
@@ -426,8 +513,9 @@ class EpsVisibilityApp(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "No scan data yet.")
             return
         os.makedirs(config.DATA_DIR, exist_ok=True)
+        default = "visibility_SIM.csv" if self._showing_sim() else "visibility.csv"
         path, _ = QFileDialog.getSaveFileName(self, "Save scan", self.last_saved or
-                                              os.path.join(config.DATA_DIR, "visibility.csv"),
+                                              os.path.join(config.DATA_DIR, default),
                                               "CSV (*.csv)")
         if path:
             self._save(path)
@@ -437,7 +525,8 @@ class EpsVisibilityApp(QMainWindow):
         if not (self.autosave.isChecked() and self.points):
             return
         os.makedirs(config.DATA_DIR, exist_ok=True)
-        path = os.path.join(config.DATA_DIR, f"visibility_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        tag = "_SIM" if self._showing_sim() else ""
+        path = os.path.join(config.DATA_DIR, f"visibility_{time.strftime('%Y%m%d_%H%M%S')}{tag}.csv")
         self._save(path)
         self.last_saved = path
         self.log(f"Saved {path} and .png")

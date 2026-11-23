@@ -11,8 +11,10 @@ def main(argv=None):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
     from PyQt6.QtWidgets import QApplication
     from .gui import EpsVisibilityApp
+    from .theme import apply_theme
 
     app = QApplication(argv)
+    apply_theme(app)                # same light look on Linux and Windows, dark desktop or not
     win = EpsVisibilityApp()
     if "--sim" in argv:
         win.sim_cb.setChecked(True)

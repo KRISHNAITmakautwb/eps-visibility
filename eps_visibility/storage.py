@@ -10,6 +10,8 @@ PARAM_KEYS = ("stage", "offset", "offset_dir", "direction", "nsteps", "step", "s
 def save_scan_csv(path, points, params, res):
     """CSV with '# key = value' header lines (parameters and visibility), then one row per point."""
     with open(path, "w", newline="", encoding="utf-8") as fh:
+        if params.get("simulated"):
+            fh.write("# *** SIMULATION - NOT REAL DATA (counts and stage were simulated) ***\n")
         fh.write(f"# {APP_TITLE} scan, started {params.get('started')}\n")
         for k in PARAM_KEYS:
             fh.write(f"# {k} = {params.get(k)}\n")
